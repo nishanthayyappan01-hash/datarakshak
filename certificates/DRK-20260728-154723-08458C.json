@@ -1,0 +1,18 @@
+{
+  "payload": {
+    "certificate_number": "DRK-20260728-154723-08458C",
+    "created_at_utc": "2026-07-28T15:47:23.565615+00:00",
+    "device_name": "Fake Test Disk",
+    "serial_number": "TEST-DISK-0001",
+    "total_bytes": 10485760,
+    "verification_status": "PASSED",
+    "wipe_method": "Single-pass zero overwrite"
+  },
+  "security": {
+    "certificate_hash": "3ffa2055e16b3fb5d4246daca0e9fbce750e39fb500468279666367f47cdaf83",
+    "digital_signature": "+Fm+OQQumofdJmDm1sXUKWZet67Y1NmN0DEgQp8jeJx0ZcbamSO546Z7P1yfa4547XmussG9Lhbl07xxHri7Cw==",
+    "hash_algorithm": "SHA-256",
+    "public_key_path": "keys\\public_key.pem",
+    "signature_algorithm": "Ed25519"
+  }
+}

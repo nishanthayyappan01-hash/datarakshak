@@ -10,3 +10,6 @@ audit_logs/*
 !audit_logs/.gitkeep
 
 data/*.db
+
+keys/*
+!keys/.gitkeep
