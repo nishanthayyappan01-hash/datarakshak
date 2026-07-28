@@ -1,5 +1,8 @@
-.venv/
-__pycache__/
-*.pyc
-lab/*.img
-certificates/*.pdf
+@(
+".venv/"
+"__pycache__/"
+"*.pyc"
+"lab/*.img"
+"certificates/*"
+"!certificates/.gitkeep"
+) | Set-Content ".gitignore"
