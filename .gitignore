@@ -1,15 +1,36 @@
-@(
-".venv/"
-"__pycache__/"
-"*.pyc"
-"lab/*.img"
-"certificates/*"
-"!certificates/.gitkeep"
-) | Set-Content ".gitignore"
+# Python virtual environments
+.venv/
+venv/
+
+# Python cache files
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Test cache
+.pytest_cache/
+.coverage
+
+# Fake test disks
+lab/*.img
+
+# Generated certificates
+certificates/*
+!certificates/.gitkeep
+
+# Generated audit logs
 audit_logs/*
 !audit_logs/.gitkeep
 
+# Local databases
 data/*.db
 
+# Cryptographic keys
 keys/*
 !keys/.gitkeep
+
+# Build output
+build/
+dist/
