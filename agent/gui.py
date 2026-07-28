@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -53,7 +54,7 @@ class DataRakshakWindow(QMainWindow):
         self.current_job_number: str | None = None
 
         self.setWindowTitle("DataRakshak")
-        self.resize(800, 900)
+        self.resize(820, 960)
 
         self.title_label = QLabel("DataRakshak")
         self.title_label.setAlignment(
@@ -89,7 +90,7 @@ class DataRakshakWindow(QMainWindow):
             Qt.AlignmentFlag.AlignCenter
         )
         self.status_label.setWordWrap(True)
-        self.status_label.setMinimumHeight(130)
+        self.status_label.setMinimumHeight(125)
         self.status_label.setStyleSheet(
             """
             QLabel {
@@ -100,6 +101,47 @@ class DataRakshakWindow(QMainWindow):
                 border: 2px solid #22c55e;
                 border-radius: 10px;
                 padding: 15px;
+            }
+            """
+        )
+
+        self.progress_label = QLabel(
+            "Operation Progress"
+        )
+        self.progress_label.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+        self.progress_label.setStyleSheet(
+            """
+            font-size: 14px;
+            font-weight: bold;
+            color: white;
+            background: transparent;
+            """
+        )
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setMinimumHeight(32)
+        self.progress_bar.setStyleSheet(
+            """
+            QProgressBar {
+                border: 2px solid #334155;
+                border-radius: 8px;
+                background-color: #1e293b;
+                color: white;
+                font-size: 14px;
+                font-weight: bold;
+                text-align: center;
+            }
+
+            QProgressBar::chunk {
+                background-color: #14b8a6;
+                border-radius: 6px;
             }
             """
         )
@@ -177,13 +219,15 @@ class DataRakshakWindow(QMainWindow):
         )
 
         layout = QVBoxLayout()
-        layout.setContentsMargins(75, 35, 75, 35)
-        layout.setSpacing(13)
+        layout.setContentsMargins(75, 32, 75, 32)
+        layout.setSpacing(12)
 
         layout.addWidget(self.title_label)
         layout.addWidget(self.subtitle_label)
-        layout.addSpacing(15)
+        layout.addSpacing(12)
         layout.addWidget(self.status_label)
+        layout.addWidget(self.progress_label)
+        layout.addWidget(self.progress_bar)
         layout.addWidget(self.create_disk_button)
         layout.addWidget(self.wipe_button)
         layout.addWidget(self.verify_button)
@@ -211,7 +255,7 @@ class DataRakshakWindow(QMainWindow):
         hover_color: str,
     ) -> QPushButton:
         button = QPushButton(text)
-        button.setMinimumHeight(50)
+        button.setMinimumHeight(48)
         button.setCursor(
             Qt.CursorShape.PointingHandCursor
         )
@@ -263,6 +307,62 @@ class DataRakshakWindow(QMainWindow):
 
         QApplication.processEvents()
 
+    def reset_progress(
+        self,
+        label: str = "Operation Progress",
+    ) -> None:
+        self.progress_label.setText(label)
+        self.progress_bar.setValue(0)
+        QApplication.processEvents()
+
+    def update_wipe_progress(
+        self,
+        progress: int,
+    ) -> None:
+        safe_progress = max(
+            0,
+            min(progress, 100),
+        )
+
+        self.progress_label.setText(
+            "Secure Wipe Progress"
+        )
+        self.progress_bar.setValue(
+            safe_progress
+        )
+
+        self.status_label.setText(
+            "Secure wipe is running...\n"
+            f"Job: {self.current_job_number}\n"
+            f"Progress: {safe_progress}%"
+        )
+
+        QApplication.processEvents()
+
+    def update_verification_progress(
+        self,
+        progress: int,
+    ) -> None:
+        safe_progress = max(
+            0,
+            min(progress, 100),
+        )
+
+        self.progress_label.setText(
+            "Verification Progress"
+        )
+        self.progress_bar.setValue(
+            safe_progress
+        )
+
+        self.status_label.setText(
+            "Verification is running...\n"
+            f"Job: {self.current_job_number}\n"
+            f"Progress: {safe_progress}%"
+        )
+
+        QApplication.processEvents()
+
     def safe_audit(
         self,
         action: str,
@@ -298,6 +398,9 @@ class DataRakshakWindow(QMainWindow):
         self.current_job_id = None
         self.current_job_number = None
 
+        self.reset_progress(
+            "Fake Disk Creation"
+        )
         self.set_busy(True)
 
         self.status_label.setText(
@@ -318,6 +421,8 @@ class DataRakshakWindow(QMainWindow):
             )
 
             size = TEST_DISK_PATH.stat().st_size
+
+            self.progress_bar.setValue(100)
 
             self.safe_audit(
                 action="CREATE_FAKE_TEST_DISK",
@@ -390,6 +495,10 @@ class DataRakshakWindow(QMainWindow):
             return
 
         self.verification_passed = False
+
+        self.reset_progress(
+            "Secure Wipe Progress"
+        )
         self.set_busy(True)
 
         self.status_label.setText(
@@ -418,13 +527,17 @@ class DataRakshakWindow(QMainWindow):
             )
 
             self.status_label.setText(
-                "Secure wipe is running...\n"
+                "Secure wipe is starting...\n"
                 f"Job: {self.current_job_number}"
             )
 
             QApplication.processEvents()
 
-            result = wipe_test_disk()
+            result = wipe_test_disk(
+                progress_callback=(
+                    self.update_wipe_progress
+                )
+            )
 
             update_wipe_job(
                 job_id=self.current_job_id,
@@ -440,8 +553,13 @@ class DataRakshakWindow(QMainWindow):
                         "written_bytes"
                     ],
                     "wipe_status": result["status"],
+                    "final_progress": result[
+                        "final_progress"
+                    ],
                 },
             )
+
+            self.progress_bar.setValue(100)
 
             self.status_label.setText(
                 "Secure wipe completed successfully ✅\n"
@@ -492,20 +610,30 @@ class DataRakshakWindow(QMainWindow):
             return
 
         self.verification_passed = False
+
+        self.reset_progress(
+            "Verification Progress"
+        )
         self.set_busy(True)
 
         self.status_label.setText(
-            "Verification is running...\n"
+            "Verification is starting...\n"
             f"Job: {self.current_job_number}"
         )
 
         QApplication.processEvents()
 
         try:
-            result = verify_test_disk()
+            result = verify_test_disk(
+                progress_callback=(
+                    self.update_verification_progress
+                )
+            )
 
             if result["status"] == "passed":
                 self.verification_passed = True
+
+                self.progress_bar.setValue(100)
 
                 update_wipe_job(
                     job_id=self.current_job_id,
@@ -522,6 +650,9 @@ class DataRakshakWindow(QMainWindow):
                         ),
                         "checked_bytes": result[
                             "checked_bytes"
+                        ],
+                        "final_progress": result[
+                            "final_progress"
                         ],
                     },
                 )
@@ -553,6 +684,9 @@ class DataRakshakWindow(QMainWindow):
                         ),
                         "failed_position": result[
                             "failed_position"
+                        ],
+                        "checked_bytes": result[
+                            "checked_bytes"
                         ],
                     },
                 )
@@ -605,6 +739,9 @@ class DataRakshakWindow(QMainWindow):
             )
             return
 
+        self.reset_progress(
+            "Certificate Generation"
+        )
         self.set_busy(True)
 
         self.status_label.setText(
@@ -622,6 +759,8 @@ class DataRakshakWindow(QMainWindow):
                 wipe_method=WIPE_METHOD,
                 verification_status="PASSED",
             )
+
+            self.progress_bar.setValue(100)
 
             update_wipe_job(
                 job_id=self.current_job_id,
@@ -690,6 +829,9 @@ class DataRakshakWindow(QMainWindow):
             self.set_busy(False)
 
     def check_audit_log(self) -> None:
+        self.reset_progress(
+            "Audit Log Verification"
+        )
         self.set_busy(True)
 
         self.status_label.setText(
@@ -701,6 +843,8 @@ class DataRakshakWindow(QMainWindow):
 
         try:
             result = verify_audit_log()
+
+            self.progress_bar.setValue(100)
 
             if result["status"] == "passed":
                 self.status_label.setText(
@@ -802,7 +946,6 @@ class DataRakshakWindow(QMainWindow):
         info_label = QLabel(
             f"Total jobs displayed: {len(jobs)}"
         )
-
         info_label.setStyleSheet(
             """
             font-size: 14px;
@@ -853,6 +996,9 @@ class DataRakshakWindow(QMainWindow):
             )
             return
 
+        self.reset_progress(
+            "Certificate Verification"
+        )
         self.set_busy(True)
 
         self.status_label.setText(
@@ -866,6 +1012,8 @@ class DataRakshakWindow(QMainWindow):
             result = verify_certificate(
                 Path(selected_file)
             )
+
+            self.progress_bar.setValue(100)
 
             self.safe_audit(
                 action="VERIFY_CERTIFICATE",
