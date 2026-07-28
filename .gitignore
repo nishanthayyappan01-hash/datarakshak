@@ -8,3 +8,5 @@
 ) | Set-Content ".gitignore"
 audit_logs/*
 !audit_logs/.gitkeep
+
+data/*.db
