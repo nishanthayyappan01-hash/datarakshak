@@ -2,158 +2,337 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
+from agent.paths import (
+    AUDIT_LOG_PATH,
+    ensure_runtime_directories,
+)
 
-AUDIT_FOLDER = Path("audit_logs")
-AUDIT_FILE = AUDIT_FOLDER / "audit_log.jsonl"
+
+GENESIS_HASH = "0" * 64
 
 
-def calculate_hash(data: dict[str, Any]) -> str:
-    """Generate a SHA-256 hash for an audit-log entry."""
+class AuditLogError(Exception):
+    """Raised when an audit-log operation fails."""
 
-    canonical_data = json.dumps(
-        data,
+
+def current_timestamp() -> str:
+    """Return the current UTC timestamp."""
+
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def canonical_json(
+    value: dict[str, Any],
+) -> str:
+    """Return deterministic JSON for hash calculation."""
+
+    return json.dumps(
+        value,
         sort_keys=True,
         separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def calculate_entry_hash(
+    entry_without_hash: dict[str, Any],
+) -> str:
+    """Calculate the SHA-256 hash of one audit entry."""
+
+    encoded_entry = canonical_json(
+        entry_without_hash
     ).encode("utf-8")
 
-    return hashlib.sha256(canonical_data).hexdigest()
+    return hashlib.sha256(
+        encoded_entry
+    ).hexdigest()
 
 
-def get_previous_hash() -> str:
-    """Read the hash of the latest audit-log entry."""
+def read_audit_entries() -> list[dict[str, Any]]:
+    """Read all non-empty audit-log entries."""
 
-    if not AUDIT_FILE.exists():
-        return "GENESIS"
+    ensure_runtime_directories()
 
-    lines = AUDIT_FILE.read_text(
-        encoding="utf-8"
-    ).splitlines()
+    if not AUDIT_LOG_PATH.exists():
+        return []
 
-    if not lines:
-        return "GENESIS"
+    try:
+        lines = AUDIT_LOG_PATH.read_text(
+            encoding="utf-8"
+        ).splitlines()
 
-    latest_entry = json.loads(lines[-1])
+    except OSError as error:
+        raise AuditLogError(
+            f"Could not read the audit log: {error}"
+        ) from error
 
-    return latest_entry["current_hash"]
+    entries: list[dict[str, Any]] = []
+
+    for line_number, line in enumerate(
+        lines,
+        start=1,
+    ):
+        if not line.strip():
+            continue
+
+        try:
+            entry = json.loads(line)
+
+        except json.JSONDecodeError as error:
+            raise AuditLogError(
+                "Invalid JSON was found in the audit log "
+                f"at line {line_number}."
+            ) from error
+
+        if not isinstance(entry, dict):
+            raise AuditLogError(
+                "Invalid audit entry format "
+                f"at line {line_number}."
+            )
+
+        entries.append(entry)
+
+    return entries
+
+
+def verify_audit_log() -> dict[str, Any]:
+    """Verify the complete audit-log hash chain."""
+
+    try:
+        entries = read_audit_entries()
+
+    except AuditLogError as error:
+        return {
+            "status": "failed",
+            "entries_checked": 0,
+            "message": str(error),
+        }
+
+    if not entries:
+        return {
+            "status": "empty",
+            "entries_checked": 0,
+            "message": "The audit log is empty.",
+        }
+
+    expected_previous_hash = GENESIS_HASH
+    entries_checked = 0
+
+    required_fields = {
+        "timestamp",
+        "action",
+        "status",
+        "details",
+        "previous_hash",
+        "entry_hash",
+    }
+
+    for line_number, entry in enumerate(
+        entries,
+        start=1,
+    ):
+        missing_fields = (
+            required_fields - set(entry.keys())
+        )
+
+        if missing_fields:
+            missing_text = ", ".join(
+                sorted(missing_fields)
+            )
+
+            return {
+                "status": "failed",
+                "entries_checked": entries_checked,
+                "failed_line": line_number,
+                "message": (
+                    "Audit entry is missing required fields "
+                    f"at line {line_number}: {missing_text}"
+                ),
+            }
+
+        stored_previous_hash = str(
+            entry.get("previous_hash")
+        )
+
+        if stored_previous_hash != expected_previous_hash:
+            return {
+                "status": "failed",
+                "entries_checked": entries_checked,
+                "failed_line": line_number,
+                "message": (
+                    "Previous-hash mismatch was found "
+                    f"at line {line_number}."
+                ),
+            }
+
+        stored_entry_hash = str(
+            entry.get("entry_hash")
+        )
+
+        entry_without_hash = {
+            key: value
+            for key, value in entry.items()
+            if key != "entry_hash"
+        }
+
+        calculated_hash = calculate_entry_hash(
+            entry_without_hash
+        )
+
+        if stored_entry_hash != calculated_hash:
+            return {
+                "status": "failed",
+                "entries_checked": entries_checked,
+                "failed_line": line_number,
+                "message": (
+                    "Audit-entry hash mismatch was found "
+                    f"at line {line_number}."
+                ),
+            }
+
+        expected_previous_hash = (
+            stored_entry_hash
+        )
+
+        entries_checked += 1
+
+    return {
+        "status": "passed",
+        "entries_checked": entries_checked,
+        "message": (
+            "The complete audit-log hash chain is valid."
+        ),
+        "final_hash": expected_previous_hash,
+    }
+
+
+def get_latest_entry_hash() -> str:
+    """Return the final valid audit-entry hash."""
+
+    verification = verify_audit_log()
+
+    if verification["status"] == "empty":
+        return GENESIS_HASH
+
+    if verification["status"] != "passed":
+        raise AuditLogError(
+            "New audit data cannot be written because "
+            f"the existing log is invalid: "
+            f"{verification['message']}"
+        )
+
+    return str(
+        verification["final_hash"]
+    )
 
 
 def write_audit_log(
     action: str,
     status: str,
     details: dict[str, Any] | None = None,
-    user: str = "Local Technician",
 ) -> dict[str, Any]:
-    """Create a tamper-evident audit-log entry."""
+    """Append one tamper-evident entry to the audit log."""
 
-    AUDIT_FOLDER.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    ensure_runtime_directories()
 
-    previous_hash = get_previous_hash()
+    clean_action = action.strip()
+    clean_status = status.strip()
 
-    entry_data = {
-        "timestamp_utc": datetime.now(
-            timezone.utc
-        ).isoformat(),
-        "user": user,
-        "action": action,
-        "status": status,
+    if not clean_action:
+        raise AuditLogError(
+            "Audit action cannot be empty."
+        )
+
+    if not clean_status:
+        raise AuditLogError(
+            "Audit status cannot be empty."
+        )
+
+    previous_hash = get_latest_entry_hash()
+
+    entry_without_hash: dict[str, Any] = {
+        "timestamp": current_timestamp(),
+        "action": clean_action,
+        "status": clean_status,
         "details": details or {},
         "previous_hash": previous_hash,
     }
 
-    current_hash = calculate_hash(entry_data)
+    entry_hash = calculate_entry_hash(
+        entry_without_hash
+    )
 
     complete_entry = {
-        **entry_data,
-        "current_hash": current_hash,
+        **entry_without_hash,
+        "entry_hash": entry_hash,
     }
 
-    with AUDIT_FILE.open(
-        "a",
-        encoding="utf-8",
-    ) as log_file:
-        log_file.write(
-            json.dumps(
-                complete_entry,
-                sort_keys=True,
+    serialized_entry = canonical_json(
+        complete_entry
+    )
+
+    try:
+        with AUDIT_LOG_PATH.open(
+            "a",
+            encoding="utf-8",
+            newline="\n",
+        ) as audit_file:
+            audit_file.write(
+                serialized_entry + "\n"
             )
-            + "\n"
-        )
 
-    return complete_entry
+            audit_file.flush()
+            os.fsync(
+                audit_file.fileno()
+            )
 
-
-def verify_audit_log() -> dict[str, Any]:
-    """Verify that the audit-log hash chain was not modified."""
-
-    if not AUDIT_FILE.exists():
-        return {
-            "status": "empty",
-            "entries_checked": 0,
-            "message": "Audit log does not exist.",
-        }
-
-    lines = AUDIT_FILE.read_text(
-        encoding="utf-8"
-    ).splitlines()
-
-    expected_previous_hash = "GENESIS"
-
-    for line_number, line in enumerate(
-        lines,
-        start=1,
-    ):
-        entry = json.loads(line)
-
-        stored_current_hash = entry.pop(
-            "current_hash"
-        )
-
-        if entry["previous_hash"] != expected_previous_hash:
-            return {
-                "status": "failed",
-                "entries_checked": line_number - 1,
-                "failed_line": line_number,
-                "message": "Previous hash does not match.",
-            }
-
-        calculated_hash = calculate_hash(entry)
-
-        if calculated_hash != stored_current_hash:
-            return {
-                "status": "failed",
-                "entries_checked": line_number - 1,
-                "failed_line": line_number,
-                "message": "Audit entry was modified.",
-            }
-
-        expected_previous_hash = stored_current_hash
+    except OSError as error:
+        raise AuditLogError(
+            f"Could not write the audit log: {error}"
+        ) from error
 
     return {
-        "status": "passed",
-        "entries_checked": len(lines),
-        "message": "Audit log hash chain is valid.",
+        "status": "written",
+        "path": str(AUDIT_LOG_PATH),
+        "entry_hash": entry_hash,
+        "previous_hash": previous_hash,
+        "entry": complete_entry,
     }
+
+
+def main() -> None:
+    """Display the current audit-log verification result."""
+
+    result = verify_audit_log()
+
+    print(
+        "Audit log path:",
+        AUDIT_LOG_PATH,
+    )
+
+    print(
+        "Verification status:",
+        result["status"],
+    )
+
+    print(
+        "Entries checked:",
+        result["entries_checked"],
+    )
+
+    print(
+        "Message:",
+        result["message"],
+    )
 
 
 if __name__ == "__main__":
-    created_entry = write_audit_log(
-        action="AUDIT_LOG_TEST",
-        status="SUCCESS",
-        details={
-            "message": "DataRakshak audit logger test",
-        },
-    )
-
-    print("Audit entry created successfully")
-    print("Current hash:", created_entry["current_hash"])
-
-    verification_result = verify_audit_log()
-
-    print("Verification result:", verification_result)
+    main()

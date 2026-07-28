@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 from typing import Callable
 
+from agent.paths import (
+    LAB_DIR,
+    TEST_DISK_PATH,
+    ensure_runtime_directories,
+)
 
-TEST_DISK_PATH = Path("lab/test_disk.img").resolve()
+
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 ProgressCallback = Callable[[int], None]
@@ -15,19 +19,17 @@ class WipeError(Exception):
     """Raised when the fake-disk wipe cannot be completed safely."""
 
 
-def validate_test_disk() -> Path:
-    """Allow only the project's fake test disk."""
+def validate_test_disk():
+    """Allow wiping only the DataRakshak fake test-disk file."""
 
-    project_folder = Path.cwd().resolve()
-    allowed_lab_folder = (
-        project_folder / "lab"
-    ).resolve()
+    ensure_runtime_directories()
 
+    allowed_lab_folder = LAB_DIR.resolve()
     test_disk = TEST_DISK_PATH.resolve()
 
     if not test_disk.exists():
         raise FileNotFoundError(
-            "lab/test_disk.img was not found. "
+            "Fake test disk was not found. "
             "Create the fake test disk first."
         )
 
@@ -39,7 +41,7 @@ def validate_test_disk() -> Path:
     if test_disk.parent != allowed_lab_folder:
         raise WipeError(
             "Safety protection blocked the wipe. "
-            "Only files inside the lab folder are allowed."
+            "Only files inside the DataRakshak lab folder are allowed."
         )
 
     if test_disk.name != "test_disk.img":

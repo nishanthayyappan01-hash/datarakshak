@@ -3,8 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
+from agent.paths import (
+    LAB_DIR,
+    TEST_DISK_PATH,
+    ensure_runtime_directories,
+)
 
-TEST_DISK_PATH = Path("lab/test_disk.img").resolve()
+
 CHUNK_SIZE = 1024 * 1024  # 1 MB
 
 ProgressCallback = Callable[[int], None]
@@ -15,18 +20,16 @@ class VerificationError(Exception):
 
 
 def validate_test_disk() -> Path:
-    """Allow verification only for the project's fake test disk."""
+    """Allow verification only for DataRakshak's fake test disk."""
 
-    project_folder = Path.cwd().resolve()
-    allowed_lab_folder = (
-        project_folder / "lab"
-    ).resolve()
+    ensure_runtime_directories()
 
+    allowed_lab_folder = LAB_DIR.resolve()
     test_disk = TEST_DISK_PATH.resolve()
 
     if not test_disk.exists():
         raise FileNotFoundError(
-            "lab/test_disk.img was not found. "
+            "Fake test disk was not found. "
             "Create and wipe the fake test disk first."
         )
 
@@ -38,7 +41,7 @@ def validate_test_disk() -> Path:
     if test_disk.parent != allowed_lab_folder:
         raise VerificationError(
             "Safety protection blocked verification. "
-            "Only files inside the lab folder are allowed."
+            "Only files inside the DataRakshak lab folder are allowed."
         )
 
     if test_disk.name != "test_disk.img":
@@ -92,7 +95,10 @@ def verify_test_disk(
                     (checked_size / total_size) * 100
                 )
 
-                progress = min(progress, 100)
+                progress = min(
+                    progress,
+                    100,
+                )
 
                 if progress != previous_progress:
                     if progress_callback is not None:
@@ -118,15 +124,17 @@ def verify_test_disk(
         print()
 
     if failed_position is not None:
+        final_progress = int(
+            (checked_size / total_size) * 100
+        )
+
         return {
             "status": "failed",
             "message": "Non-zero data was found.",
             "failed_position": failed_position,
             "checked_bytes": checked_size,
             "total_bytes": total_size,
-            "final_progress": int(
-                (checked_size / total_size) * 100
-            ),
+            "final_progress": final_progress,
         }
 
     if checked_size != total_size:

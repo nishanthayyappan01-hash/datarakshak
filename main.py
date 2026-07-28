@@ -1,28 +1,6 @@
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-
-PROJECT_ROOT = Path(__file__).resolve().parent
-
-
-def prepare_project() -> None:
-    """Prepare required local folders before starting the GUI."""
-
-    required_folders = [
-        PROJECT_ROOT / "lab",
-        PROJECT_ROOT / "data",
-        PROJECT_ROOT / "certificates",
-        PROJECT_ROOT / "audit_logs",
-        PROJECT_ROOT / "keys",
-    ]
-
-    for folder in required_folders:
-        folder.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+from agent.paths import ensure_runtime_directories
 
 
 def main() -> None:
@@ -31,7 +9,7 @@ def main() -> None:
     print("DataRakshak project started successfully")
 
     try:
-        prepare_project()
+        ensure_runtime_directories()
 
         from agent.gui import start_application
 
