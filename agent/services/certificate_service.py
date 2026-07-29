@@ -5,406 +5,744 @@ import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import qrcode
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import (
+    ParagraphStyle,
+    getSampleStyleSheet,
+)
 from reportlab.lib.units import mm
-from reportlab.pdfgen import canvas
+from reportlab.platypus import (
+    Image,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
+from agent.paths import (
+    CERTIFICATES_DIR,
+    ensure_runtime_directories,
+)
 from agent.services.signature_service import (
-    PUBLIC_KEY_PATH,
-    generate_key_pair,
-    sign_data,
+    SIGNATURE_ALGORITHM,
+    canonical_json_bytes,
+    sign_payload,
 )
 
 
-CERTIFICATES_FOLDER = Path("certificates")
+class CertificateServiceError(Exception):
+    """Raised when certificate generation fails."""
 
 
-def convert_to_canonical_bytes(
-    data: dict,
-) -> bytes:
-    """Convert certificate data into stable JSON bytes."""
+def current_timestamp() -> str:
+    """Return the current UTC timestamp."""
 
-    return json.dumps(
-        data,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
-
-
-def split_text(
-    text: str,
-    length: int = 48,
-) -> list[str]:
-    """Split long hash or signature text into smaller lines."""
-
-    return [
-        text[index : index + length]
-        for index in range(0, len(text), length)
-    ]
-
-
-def generate_certificate(
-    device_name: str = "Fake Test Disk",
-    serial_number: str = "TEST-DISK-0001",
-    total_bytes: int = 10 * 1024 * 1024,
-    wipe_method: str = "Single-pass zero overwrite",
-    verification_status: str = "PASSED",
-) -> dict:
-    """Generate a digitally signed PDF wipe certificate."""
-
-    CERTIFICATES_FOLDER.mkdir(
-        parents=True,
-        exist_ok=True,
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
     )
 
-    generate_key_pair()
 
-    created_at = datetime.now(timezone.utc)
+def create_certificate_number() -> str:
+    """Create a unique DataRakshak certificate number."""
+
+    timestamp = datetime.now(
+        timezone.utc
+    ).strftime("%Y%m%d-%H%M%S")
 
     unique_part = uuid.uuid4().hex[:6].upper()
 
-    certificate_number = (
-        f"DRK-"
-        f"{created_at.strftime('%Y%m%d-%H%M%S')}-"
-        f"{unique_part}"
+    return (
+        f"DRK-{timestamp}-{unique_part}"
     )
 
-    signed_payload = {
-        "certificate_number": certificate_number,
-        "device_name": device_name,
-        "serial_number": serial_number,
-        "total_bytes": total_bytes,
-        "wipe_method": wipe_method,
-        "verification_status": verification_status,
-        "created_at_utc": created_at.isoformat(),
-    }
 
-    payload_bytes = convert_to_canonical_bytes(
-        signed_payload
-    )
+def calculate_payload_hash(
+    payload: dict[str, Any],
+) -> str:
+    """Calculate the SHA-256 hash of the certificate payload."""
 
-    certificate_hash = hashlib.sha256(
-        payload_bytes
+    return hashlib.sha256(
+        canonical_json_bytes(payload)
     ).hexdigest()
 
-    digital_signature = sign_data(
-        payload_bytes
+
+def validate_certificate_inputs(
+    device_name: str,
+    serial_number: str,
+    total_bytes: int,
+    wipe_method: str,
+    verification_status: str,
+) -> None:
+    """Validate certificate-generation inputs."""
+
+    if not device_name.strip():
+        raise CertificateServiceError(
+            "Device name cannot be empty."
+        )
+
+    if not serial_number.strip():
+        raise CertificateServiceError(
+            "Serial number cannot be empty."
+        )
+
+    if total_bytes <= 0:
+        raise CertificateServiceError(
+            "Total bytes must be greater than zero."
+        )
+
+    if not wipe_method.strip():
+        raise CertificateServiceError(
+            "Wipe method cannot be empty."
+        )
+
+    if verification_status.strip().upper() != "PASSED":
+        raise CertificateServiceError(
+            "A certificate can be generated only "
+            "after successful wipe verification."
+        )
+
+
+def format_bytes(
+    size_bytes: int,
+) -> str:
+    """Convert bytes into a readable value."""
+
+    units = [
+        "bytes",
+        "KB",
+        "MB",
+        "GB",
+        "TB",
+    ]
+
+    size = float(size_bytes)
+    unit_index = 0
+
+    while (
+        size >= 1024
+        and unit_index < len(units) - 1
+    ):
+        size /= 1024
+        unit_index += 1
+
+    return (
+        f"{size:.2f} {units[unit_index]} "
+        f"({size_bytes} bytes)"
     )
 
-    certificate_record = {
-        "payload": signed_payload,
-        "security": {
-            "hash_algorithm": "SHA-256",
-            "certificate_hash": certificate_hash,
-            "signature_algorithm": "Ed25519",
-            "digital_signature": digital_signature,
-            "public_key_path": str(PUBLIC_KEY_PATH),
-        },
-    }
 
-    json_path = CERTIFICATES_FOLDER / (
-        f"{certificate_number}.json"
+def split_long_value(
+    value: str,
+    group_size: int = 32,
+) -> str:
+    """Insert spaces into long cryptographic values for PDF display."""
+
+    return " ".join(
+        value[index:index + group_size]
+        for index in range(
+            0,
+            len(value),
+            group_size,
+        )
     )
 
-    json_path.write_text(
-        json.dumps(
-            certificate_record,
-            indent=2,
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
+
+def create_qr_code(
+    certificate_number: str,
+    certificate_hash: str,
+    public_key_fingerprint: str,
+    qr_path: Path,
+) -> None:
+    """Create a QR image containing certificate verification data."""
 
     qr_data = {
         "certificate_number": certificate_number,
-        "verification_status": verification_status,
         "certificate_hash": certificate_hash,
-        "signature_algorithm": "Ed25519",
-        "digital_signature": digital_signature,
+        "signature_algorithm": SIGNATURE_ALGORITHM,
+        "public_key_fingerprint": (
+            public_key_fingerprint
+        ),
     }
 
-    qr_content = json.dumps(
-        qr_data,
-        sort_keys=True,
-        separators=(",", ":"),
+    try:
+        qr_image = qrcode.make(
+            json.dumps(
+                qr_data,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+
+        qr_image.save(qr_path)
+
+    except Exception as error:
+        raise CertificateServiceError(
+            f"Could not create the QR code: {error}"
+        ) from error
+
+
+def create_pdf_certificate(
+    payload: dict[str, Any],
+    certificate_hash: str,
+    signature_information: dict[str, str],
+    pdf_path: Path,
+    qr_path: Path,
+) -> None:
+    """Create the printable DataRakshak PDF certificate."""
+
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        name="DataRakshakTitle",
+        parent=styles["Title"],
+        fontSize=24,
+        leading=30,
+        alignment=TA_CENTER,
+        textColor=colors.HexColor("#0F766E"),
+        spaceAfter=8,
     )
 
-    qr_image = qrcode.make(qr_content)
-
-    qr_path = CERTIFICATES_FOLDER / (
-        f"{certificate_number}_qr.png"
+    subtitle_style = ParagraphStyle(
+        name="DataRakshakSubtitle",
+        parent=styles["Normal"],
+        fontSize=12,
+        leading=16,
+        alignment=TA_CENTER,
+        textColor=colors.HexColor("#334155"),
+        spaceAfter=18,
     )
 
-    qr_image.save(qr_path)
-
-    pdf_path = CERTIFICATES_FOLDER / (
-        f"{certificate_number}.pdf"
+    section_style = ParagraphStyle(
+        name="DataRakshakSection",
+        parent=styles["Heading2"],
+        fontSize=14,
+        leading=18,
+        textColor=colors.HexColor("#0F172A"),
+        spaceBefore=10,
+        spaceAfter=8,
     )
 
-    pdf = canvas.Canvas(
+    normal_style = ParagraphStyle(
+        name="DataRakshakNormal",
+        parent=styles["Normal"],
+        fontSize=9,
+        leading=13,
+        textColor=colors.HexColor("#111827"),
+    )
+
+    small_style = ParagraphStyle(
+        name="DataRakshakSmall",
+        parent=styles["Normal"],
+        fontSize=7,
+        leading=10,
+        textColor=colors.HexColor("#334155"),
+    )
+
+    document = SimpleDocTemplate(
         str(pdf_path),
         pagesize=A4,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm,
+        topMargin=15 * mm,
+        bottomMargin=15 * mm,
+        title=(
+            "DataRakshak Secure Wipe Certificate"
+        ),
+        author="DataRakshak",
     )
 
-    page_width, page_height = A4
+    story: list[Any] = []
 
-    pdf.setTitle(
-        f"DataRakshak Certificate {certificate_number}"
+    story.append(
+        Paragraph(
+            "DataRakshak",
+            title_style,
+        )
     )
 
-    pdf.setAuthor("DataRakshak")
-    pdf.setSubject(
-        "Digitally Signed Secure Data Wipe Certificate"
+    story.append(
+        Paragraph(
+            "Secure Data Wiping and Verification Certificate",
+            subtitle_style,
+        )
     )
 
-    pdf.setFont("Helvetica-Bold", 25)
-
-    pdf.drawCentredString(
-        page_width / 2,
-        page_height - 28 * mm,
-        "DataRakshak",
-    )
-
-    pdf.setFont("Helvetica-Bold", 16)
-
-    pdf.drawCentredString(
-        page_width / 2,
-        page_height - 40 * mm,
-        "Secure Data Wipe Certificate",
-    )
-
-    pdf.setFont("Helvetica", 10)
-
-    pdf.drawCentredString(
-        page_width / 2,
-        page_height - 47 * mm,
-        "Digitally signed using Ed25519",
-    )
-
-    pdf.line(
-        25 * mm,
-        page_height - 54 * mm,
-        page_width - 25 * mm,
-        page_height - 54 * mm,
+    story.append(
+        Paragraph(
+            "Certificate Details",
+            section_style,
+        )
     )
 
     details = [
-        (
+        [
             "Certificate Number",
-            certificate_number,
-        ),
-        (
+            payload["certificate_number"],
+        ],
+        [
+            "Issued At",
+            payload["issued_at"],
+        ],
+        [
             "Device Name",
-            device_name,
-        ),
-        (
+            payload["device_name"],
+        ],
+        [
             "Serial Number",
-            serial_number,
-        ),
-        (
+            payload["serial_number"],
+        ],
+        [
             "Storage Size",
-            f"{total_bytes} bytes",
-        ),
-        (
-            "Wipe Method",
-            wipe_method,
-        ),
-        (
-            "Verification Status",
-            verification_status,
-        ),
-        (
-            "Created At",
-            created_at.strftime(
-                "%Y-%m-%d %H:%M:%S UTC"
+            format_bytes(
+                int(payload["total_bytes"])
             ),
-        ),
-        (
-            "Signature Algorithm",
-            "Ed25519",
-        ),
-        (
-            "Hash Algorithm",
-            "SHA-256",
-        ),
+        ],
+        [
+            "Wipe Method",
+            payload["wipe_method"],
+        ],
+        [
+            "Verification Status",
+            payload["verification_status"],
+        ],
     ]
 
-    current_y = page_height - 68 * mm
+    formatted_details = [
+        [
+            Paragraph(
+                f"<b>{label}</b>",
+                normal_style,
+            ),
+            Paragraph(
+                str(value),
+                normal_style,
+            ),
+        ]
+        for label, value in details
+    ]
 
-    for label, value in details:
-        pdf.setFont(
-            "Helvetica-Bold",
-            10,
-        )
-
-        pdf.drawString(
-            27 * mm,
-            current_y,
-            f"{label}:",
-        )
-
-        pdf.setFont(
-            "Helvetica",
-            10,
-        )
-
-        pdf.drawString(
-            72 * mm,
-            current_y,
-            str(value),
-        )
-
-        current_y -= 9 * mm
-
-    current_y -= 2 * mm
-
-    pdf.setFont(
-        "Helvetica-Bold",
-        10,
+    details_table = Table(
+        formatted_details,
+        colWidths=[
+            52 * mm,
+            118 * mm,
+        ],
+        repeatRows=0,
     )
 
-    pdf.drawString(
-        27 * mm,
-        current_y,
-        "Certificate SHA-256 Hash:",
-    )
-
-    current_y -= 7 * mm
-
-    pdf.setFont(
-        "Courier",
-        8,
-    )
-
-    for hash_line in split_text(
-        certificate_hash,
-        length=40,
-    ):
-        pdf.drawString(
-            27 * mm,
-            current_y,
-            hash_line,
+    details_table.setStyle(
+        TableStyle(
+            [
+                (
+                    "BACKGROUND",
+                    (0, 0),
+                    (0, -1),
+                    colors.HexColor("#E2E8F0"),
+                ),
+                (
+                    "BACKGROUND",
+                    (1, 0),
+                    (1, -1),
+                    colors.HexColor("#F8FAFC"),
+                ),
+                (
+                    "GRID",
+                    (0, 0),
+                    (-1, -1),
+                    0.5,
+                    colors.HexColor("#94A3B8"),
+                ),
+                (
+                    "VALIGN",
+                    (0, 0),
+                    (-1, -1),
+                    "TOP",
+                ),
+                (
+                    "LEFTPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    8,
+                ),
+                (
+                    "RIGHTPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    8,
+                ),
+                (
+                    "TOPPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    7,
+                ),
+                (
+                    "BOTTOMPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    7,
+                ),
+            ]
         )
-
-        current_y -= 5 * mm
-
-    current_y -= 4 * mm
-
-    pdf.setFont(
-        "Helvetica-Bold",
-        10,
     )
 
-    pdf.drawString(
-        27 * mm,
-        current_y,
-        "Ed25519 Digital Signature:",
-    )
+    story.append(details_table)
+    story.append(Spacer(1, 10 * mm))
 
-    current_y -= 7 * mm
-
-    pdf.setFont(
-        "Courier",
-        7,
-    )
-
-    for signature_line in split_text(
-        digital_signature,
-        length=52,
-    ):
-        pdf.drawString(
-            27 * mm,
-            current_y,
-            signature_line,
+    story.append(
+        Paragraph(
+            "Cryptographic Verification",
+            section_style,
         )
+    )
 
-        current_y -= 5 * mm
+    certificate_hash_display = split_long_value(
+        certificate_hash
+    )
 
-    pdf.drawImage(
+    fingerprint_display = split_long_value(
+        signature_information[
+            "public_key_fingerprint"
+        ]
+    )
+
+    crypto_details = [
+        [
+            "Hash Algorithm",
+            "SHA-256",
+        ],
+        [
+            "Certificate Hash",
+            certificate_hash_display,
+        ],
+        [
+            "Signature Algorithm",
+            signature_information[
+                "algorithm"
+            ],
+        ],
+        [
+            "Public-Key Fingerprint",
+            fingerprint_display,
+        ],
+    ]
+
+    formatted_crypto_details = [
+        [
+            Paragraph(
+                f"<b>{label}</b>",
+                small_style,
+            ),
+            Paragraph(
+                str(value),
+                small_style,
+            ),
+        ]
+        for label, value in crypto_details
+    ]
+
+    crypto_table = Table(
+        formatted_crypto_details,
+        colWidths=[
+            52 * mm,
+            118 * mm,
+        ],
+    )
+
+    crypto_table.setStyle(
+        TableStyle(
+            [
+                (
+                    "BACKGROUND",
+                    (0, 0),
+                    (0, -1),
+                    colors.HexColor("#CCFBF1"),
+                ),
+                (
+                    "BACKGROUND",
+                    (1, 0),
+                    (1, -1),
+                    colors.white,
+                ),
+                (
+                    "GRID",
+                    (0, 0),
+                    (-1, -1),
+                    0.5,
+                    colors.HexColor("#5EEAD4"),
+                ),
+                (
+                    "VALIGN",
+                    (0, 0),
+                    (-1, -1),
+                    "TOP",
+                ),
+                (
+                    "LEFTPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    8,
+                ),
+                (
+                    "RIGHTPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    8,
+                ),
+                (
+                    "TOPPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    7,
+                ),
+                (
+                    "BOTTOMPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    7,
+                ),
+            ]
+        )
+    )
+
+    story.append(crypto_table)
+    story.append(Spacer(1, 8 * mm))
+
+    qr_image = Image(
         str(qr_path),
-        page_width - 63 * mm,
-        24 * mm,
         width=38 * mm,
         height=38 * mm,
-        preserveAspectRatio=True,
-        mask="auto",
     )
 
-    pdf.setFont(
-        "Helvetica-Bold",
-        9,
+    qr_table = Table(
+        [
+            [
+                qr_image,
+                Paragraph(
+                    (
+                        "<b>Verification QR Code</b><br/><br/>"
+                        "The QR code contains the certificate "
+                        "number, SHA-256 hash, signature algorithm "
+                        "and public-key fingerprint."
+                    ),
+                    normal_style,
+                ),
+            ]
+        ],
+        colWidths=[
+            48 * mm,
+            122 * mm,
+        ],
     )
 
-    pdf.drawString(
-        27 * mm,
-        35 * mm,
-        "Digital Signature Status: SIGNED",
+    qr_table.setStyle(
+        TableStyle(
+            [
+                (
+                    "VALIGN",
+                    (0, 0),
+                    (-1, -1),
+                    "MIDDLE",
+                ),
+                (
+                    "BOX",
+                    (0, 0),
+                    (-1, -1),
+                    0.7,
+                    colors.HexColor("#CBD5E1"),
+                ),
+                (
+                    "LEFTPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    8,
+                ),
+                (
+                    "RIGHTPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    8,
+                ),
+                (
+                    "TOPPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    8,
+                ),
+                (
+                    "BOTTOMPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    8,
+                ),
+            ]
+        )
     )
 
-    pdf.setFont(
-        "Helvetica",
-        8,
+    story.append(qr_table)
+    story.append(Spacer(1, 8 * mm))
+
+    story.append(
+        Paragraph(
+            (
+                "<b>Declaration:</b> The specified test storage "
+                "target was overwritten using the recorded wipe "
+                "method and the resulting content passed software "
+                "verification. This document belongs to the "
+                "DataRakshak prototype and is digitally signed "
+                "using the local Ed25519 key."
+            ),
+            small_style,
+        )
     )
 
-    pdf.drawString(
-        27 * mm,
-        28 * mm,
-        "Prototype certificate generated by DataRakshak.",
+    try:
+        document.build(story)
+
+    except Exception as error:
+        raise CertificateServiceError(
+            f"Could not create the PDF certificate: {error}"
+        ) from error
+
+
+def generate_certificate(
+    device_name: str,
+    serial_number: str,
+    total_bytes: int,
+    wipe_method: str,
+    verification_status: str,
+) -> dict[str, Any]:
+    """Generate signed JSON, PDF and QR certificate files."""
+
+    ensure_runtime_directories()
+
+    validate_certificate_inputs(
+        device_name=device_name,
+        serial_number=serial_number,
+        total_bytes=total_bytes,
+        wipe_method=wipe_method,
+        verification_status=verification_status,
     )
 
-    pdf.drawString(
-        27 * mm,
-        23 * mm,
-        "Current version operates only on the fake test disk.",
+    certificate_number = (
+        create_certificate_number()
     )
 
-    pdf.save()
+    payload: dict[str, Any] = {
+        "certificate_number": certificate_number,
+        "issued_at": current_timestamp(),
+        "issuer": "DataRakshak",
+        "device_name": device_name.strip(),
+        "serial_number": serial_number.strip(),
+        "total_bytes": total_bytes,
+        "wipe_method": wipe_method.strip(),
+        "verification_status": (
+            verification_status.strip().upper()
+        ),
+    }
+
+    certificate_hash = calculate_payload_hash(
+        payload
+    )
+
+    signature_information = sign_payload(
+        payload
+    )
+
+    certificate_document = {
+        "schema_version": "1.0",
+        "payload": payload,
+        "certificate_hash": certificate_hash,
+        "digital_signature": {
+            "algorithm": signature_information[
+                "algorithm"
+            ],
+            "signature": signature_information[
+                "signature"
+            ],
+            "public_key_fingerprint": (
+                signature_information[
+                    "public_key_fingerprint"
+                ]
+            ),
+        },
+    }
+
+    pdf_path = (
+        CERTIFICATES_DIR
+        / f"{certificate_number}.pdf"
+    )
+
+    json_path = (
+        CERTIFICATES_DIR
+        / f"{certificate_number}.json"
+    )
+
+    qr_path = (
+        CERTIFICATES_DIR
+        / f"{certificate_number}_qr.png"
+    )
+
+    try:
+        json_path.write_text(
+            json.dumps(
+                certificate_document,
+                indent=2,
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        create_qr_code(
+            certificate_number=certificate_number,
+            certificate_hash=certificate_hash,
+            public_key_fingerprint=(
+                signature_information[
+                    "public_key_fingerprint"
+                ]
+            ),
+            qr_path=qr_path,
+        )
+
+        create_pdf_certificate(
+            payload=payload,
+            certificate_hash=certificate_hash,
+            signature_information=(
+                signature_information
+            ),
+            pdf_path=pdf_path,
+            qr_path=qr_path,
+        )
+
+    except CertificateServiceError:
+        raise
+
+    except OSError as error:
+        raise CertificateServiceError(
+            f"Could not save certificate files: {error}"
+        ) from error
 
     return {
         "status": "created",
         "certificate_number": certificate_number,
         "certificate_hash": certificate_hash,
-        "digital_signature": digital_signature,
-        "signature_algorithm": "Ed25519",
+        "signature_algorithm": (
+            signature_information["algorithm"]
+        ),
+        "public_key_fingerprint": (
+            signature_information[
+                "public_key_fingerprint"
+            ]
+        ),
         "pdf_path": str(pdf_path),
-        "qr_path": str(qr_path),
         "json_path": str(json_path),
-        "public_key_path": str(PUBLIC_KEY_PATH),
+        "qr_path": str(qr_path),
     }
-
-
-if __name__ == "__main__":
-    result = generate_certificate()
-
-    print("Digitally signed certificate created successfully")
-    print(
-        "Certificate number:",
-        result["certificate_number"],
-    )
-    print(
-        "PDF path:",
-        result["pdf_path"],
-    )
-    print(
-        "JSON path:",
-        result["json_path"],
-    )
-    print(
-        "QR path:",
-        result["qr_path"],
-    )
-    print(
-        "SHA-256:",
-        result["certificate_hash"],
-    )
-    print(
-        "Signature algorithm:",
-        result["signature_algorithm"],
-    )
-    print(
-        "Digital signature:",
-        result["digital_signature"],
-    )

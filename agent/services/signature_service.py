@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
-from pathlib import Path
+import hashlib
+import json
+from typing import Any
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -10,32 +12,45 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PublicKey,
 )
 
+from agent.paths import (
+    PRIVATE_KEY_PATH,
+    PUBLIC_KEY_PATH,
+    ensure_runtime_directories,
+)
 
-KEYS_FOLDER = Path("keys")
-PRIVATE_KEY_PATH = KEYS_FOLDER / "private_key.pem"
-PUBLIC_KEY_PATH = KEYS_FOLDER / "public_key.pem"
+
+SIGNATURE_ALGORITHM = "Ed25519"
 
 
-def generate_key_pair() -> dict[str, str]:
-    """Generate an Ed25519 private and public key pair."""
+class SignatureServiceError(Exception):
+    """Raised when a digital-signature operation fails."""
 
-    KEYS_FOLDER.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
 
-    if (
-        PRIVATE_KEY_PATH.exists()
-        and PUBLIC_KEY_PATH.exists()
-    ):
-        return {
-            "status": "already_exists",
-            "private_key_path": str(PRIVATE_KEY_PATH),
-            "public_key_path": str(PUBLIC_KEY_PATH),
-        }
+def canonical_json_bytes(
+    payload: dict[str, Any],
+) -> bytes:
+    """Convert a dictionary into deterministic JSON bytes."""
 
-    private_key = Ed25519PrivateKey.generate()
-    public_key = private_key.public_key()
+    try:
+        canonical_text = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+
+    except (TypeError, ValueError) as error:
+        raise SignatureServiceError(
+            f"Payload cannot be converted to JSON: {error}"
+        ) from error
+
+    return canonical_text.encode("utf-8")
+
+
+def save_private_key(
+    private_key: Ed25519PrivateKey,
+) -> None:
+    """Save the Ed25519 private key in PEM format."""
 
     private_key_bytes = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
@@ -43,112 +58,236 @@ def generate_key_pair() -> dict[str, str]:
         encryption_algorithm=serialization.NoEncryption(),
     )
 
+    try:
+        PRIVATE_KEY_PATH.write_bytes(
+            private_key_bytes
+        )
+
+    except OSError as error:
+        raise SignatureServiceError(
+            f"Could not save the private key: {error}"
+        ) from error
+
+
+def save_public_key(
+    public_key: Ed25519PublicKey,
+) -> None:
+    """Save the Ed25519 public key in PEM format."""
+
     public_key_bytes = public_key.public_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PublicFormat.SubjectPublicKeyInfo,
     )
 
-    PRIVATE_KEY_PATH.write_bytes(
-        private_key_bytes
-    )
+    try:
+        PUBLIC_KEY_PATH.write_bytes(
+            public_key_bytes
+        )
 
-    PUBLIC_KEY_PATH.write_bytes(
-        public_key_bytes
-    )
+    except OSError as error:
+        raise SignatureServiceError(
+            f"Could not save the public key: {error}"
+        ) from error
+
+
+def generate_key_pair() -> dict[str, str]:
+    """Generate and save a new Ed25519 signing-key pair."""
+
+    ensure_runtime_directories()
+
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key()
+
+    save_private_key(private_key)
+    save_public_key(public_key)
 
     return {
-        "status": "created",
+        "algorithm": SIGNATURE_ALGORITHM,
         "private_key_path": str(PRIVATE_KEY_PATH),
         "public_key_path": str(PUBLIC_KEY_PATH),
+        "public_key_fingerprint": (
+            get_public_key_fingerprint(public_key)
+        ),
     }
 
 
 def load_private_key() -> Ed25519PrivateKey:
     """Load the local Ed25519 private key."""
 
+    ensure_runtime_directories()
+
     if not PRIVATE_KEY_PATH.exists():
-        generate_key_pair()
+        raise SignatureServiceError(
+            "The private signing key was not found."
+        )
 
-    private_key_data = PRIVATE_KEY_PATH.read_bytes()
+    try:
+        key_data = PRIVATE_KEY_PATH.read_bytes()
 
-    private_key = serialization.load_pem_private_key(
-        private_key_data,
-        password=None,
-    )
+        loaded_key = serialization.load_pem_private_key(
+            key_data,
+            password=None,
+        )
+
+    except (OSError, ValueError, TypeError) as error:
+        raise SignatureServiceError(
+            f"Could not load the private key: {error}"
+        ) from error
 
     if not isinstance(
-        private_key,
+        loaded_key,
         Ed25519PrivateKey,
     ):
-        raise TypeError(
+        raise SignatureServiceError(
             "The stored private key is not an Ed25519 key."
         )
 
-    return private_key
+    return loaded_key
 
 
 def load_public_key() -> Ed25519PublicKey:
     """Load the local Ed25519 public key."""
 
+    ensure_runtime_directories()
+
     if not PUBLIC_KEY_PATH.exists():
-        generate_key_pair()
+        raise SignatureServiceError(
+            "The public verification key was not found."
+        )
 
-    public_key_data = PUBLIC_KEY_PATH.read_bytes()
+    try:
+        key_data = PUBLIC_KEY_PATH.read_bytes()
 
-    public_key = serialization.load_pem_public_key(
-        public_key_data
-    )
+        loaded_key = serialization.load_pem_public_key(
+            key_data
+        )
+
+    except (OSError, ValueError, TypeError) as error:
+        raise SignatureServiceError(
+            f"Could not load the public key: {error}"
+        ) from error
 
     if not isinstance(
-        public_key,
+        loaded_key,
         Ed25519PublicKey,
     ):
-        raise TypeError(
+        raise SignatureServiceError(
             "The stored public key is not an Ed25519 key."
         )
 
-    return public_key
+    return loaded_key
 
 
-def sign_data(data: bytes) -> str:
-    """Digitally sign bytes and return a Base64 signature."""
+def ensure_signing_keys() -> dict[str, str]:
+    """Create signing keys only when both key files are absent."""
 
-    if not isinstance(data, bytes):
-        raise TypeError(
-            "Data supplied for signing must be bytes."
-        )
+    ensure_runtime_directories()
 
-    private_key = load_private_key()
+    private_exists = PRIVATE_KEY_PATH.exists()
+    public_exists = PUBLIC_KEY_PATH.exists()
 
-    signature = private_key.sign(data)
+    if not private_exists and not public_exists:
+        return generate_key_pair()
 
-    return base64.b64encode(
-        signature
-    ).decode("utf-8")
+    if private_exists and not public_exists:
+        private_key = load_private_key()
+        public_key = private_key.public_key()
 
+        save_public_key(public_key)
 
-def verify_signature(
-    data: bytes,
-    signature_base64: str,
-) -> bool:
-    """Verify a Base64 Ed25519 digital signature."""
-
-    if not isinstance(data, bytes):
-        raise TypeError(
-            "Data supplied for verification must be bytes."
+    elif public_exists and not private_exists:
+        raise SignatureServiceError(
+            "The public key exists, but the private key is missing. "
+            "Certificate signing has been blocked to prevent "
+            "an accidental key replacement."
         )
 
     public_key = load_public_key()
 
+    return {
+        "algorithm": SIGNATURE_ALGORITHM,
+        "private_key_path": str(PRIVATE_KEY_PATH),
+        "public_key_path": str(PUBLIC_KEY_PATH),
+        "public_key_fingerprint": (
+            get_public_key_fingerprint(public_key)
+        ),
+    }
+
+
+def get_public_key_fingerprint(
+    public_key: Ed25519PublicKey | None = None,
+) -> str:
+    """Return the SHA-256 fingerprint of the public key."""
+
+    active_public_key = (
+        public_key
+        if public_key is not None
+        else load_public_key()
+    )
+
+    public_key_bytes = active_public_key.public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+
+    return hashlib.sha256(
+        public_key_bytes
+    ).hexdigest()
+
+
+def sign_payload(
+    payload: dict[str, Any],
+) -> dict[str, str]:
+    """Digitally sign a canonical JSON payload."""
+
+    ensure_signing_keys()
+
+    private_key = load_private_key()
+    payload_bytes = canonical_json_bytes(payload)
+
     try:
-        signature = base64.b64decode(
+        signature_bytes = private_key.sign(
+            payload_bytes
+        )
+
+    except Exception as error:
+        raise SignatureServiceError(
+            f"Could not sign the certificate payload: {error}"
+        ) from error
+
+    signature_base64 = base64.b64encode(
+        signature_bytes
+    ).decode("ascii")
+
+    return {
+        "algorithm": SIGNATURE_ALGORITHM,
+        "signature": signature_base64,
+        "public_key_fingerprint": (
+            get_public_key_fingerprint()
+        ),
+    }
+
+
+def verify_payload_signature(
+    payload: dict[str, Any],
+    signature_base64: str,
+) -> bool:
+    """Verify an Ed25519 signature using the local public key."""
+
+    if not signature_base64.strip():
+        return False
+
+    try:
+        signature_bytes = base64.b64decode(
             signature_base64,
             validate=True,
         )
 
+        public_key = load_public_key()
+
         public_key.verify(
-            signature,
-            data,
+            signature_bytes,
+            canonical_json_bytes(payload),
         )
 
         return True
@@ -157,54 +296,36 @@ def verify_signature(
         InvalidSignature,
         ValueError,
         TypeError,
+        SignatureServiceError,
     ):
         return False
 
 
+def main() -> None:
+    """Prepare signing keys and display safe key information."""
+
+    key_information = ensure_signing_keys()
+
+    print(
+        "Signature algorithm:",
+        key_information["algorithm"],
+    )
+
+    print(
+        "Private key path:",
+        key_information["private_key_path"],
+    )
+
+    print(
+        "Public key path:",
+        key_information["public_key_path"],
+    )
+
+    print(
+        "Public-key fingerprint:",
+        key_information["public_key_fingerprint"],
+    )
+
+
 if __name__ == "__main__":
-    key_result = generate_key_pair()
-
-    print("Key status:", key_result["status"])
-    print(
-        "Private key:",
-        key_result["private_key_path"],
-    )
-    print(
-        "Public key:",
-        key_result["public_key_path"],
-    )
-
-    original_data = (
-        b"DataRakshak certificate test data"
-    )
-
-    digital_signature = sign_data(
-        original_data
-    )
-
-    print("\nDigital signature created:")
-    print(digital_signature)
-
-    original_result = verify_signature(
-        original_data,
-        digital_signature,
-    )
-
-    print(
-        "\nOriginal data verification:",
-        original_result,
-    )
-
-    modified_data = (
-        b"DataRakshak certificate MODIFIED data"
-    )
-
-    modified_result = verify_signature(
-        modified_data,
-        digital_signature,
-    )
-
-    print(
-        "Modified data verification:",
-        modified_result,
-    )
+    main()
