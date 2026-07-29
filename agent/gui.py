@@ -1,8 +1,14 @@
+from __future__ import annotations
+
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import (
+    Qt,
+    QThread,
+)
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -19,23 +25,38 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from agent.paths import (
+    CERTIFICATES_DIR,
+    TEST_DISK_PATH,
+    ensure_runtime_directories,
+)
 from agent.services.audit_logger import (
     verify_audit_log,
     write_audit_log,
 )
-from agent.services.certificate_service import generate_certificate
-from agent.services.certificate_verifier import verify_certificate
+from agent.services.certificate_service import (
+    generate_certificate,
+)
+from agent.services.certificate_verifier import (
+    verify_certificate,
+)
 from agent.services.database_service import (
     create_wipe_job,
     initialize_database,
     list_wipe_jobs,
     update_wipe_job,
 )
-from agent.services.verifier import verify_test_disk
-from agent.services.wipe_engine import wipe_test_disk
+from agent.services.operation_worker import (
+    OperationWorker,
+)
+from agent.services.verifier import (
+    verify_test_disk,
+)
+from agent.services.wipe_engine import (
+    wipe_test_disk,
+)
 
 
-TEST_DISK_PATH = Path("lab/test_disk.img")
 TEST_DISK_SIZE = 10 * 1024 * 1024
 
 DEVICE_NAME = "Fake Test Disk"
@@ -47,11 +68,17 @@ class DataRakshakWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
 
+        ensure_runtime_directories()
         initialize_database()
 
         self.verification_passed = False
+
         self.current_job_id: int | None = None
         self.current_job_number: str | None = None
+
+        self.operation_thread: QThread | None = None
+        self.operation_worker: OperationWorker | None = None
+        self.active_operation: str | None = None
 
         self.setWindowTitle("DataRakshak")
         self.resize(820, 960)
@@ -219,7 +246,12 @@ class DataRakshakWindow(QMainWindow):
         )
 
         layout = QVBoxLayout()
-        layout.setContentsMargins(75, 32, 75, 32)
+        layout.setContentsMargins(
+            75,
+            32,
+            75,
+            32,
+        )
         layout.setSpacing(12)
 
         layout.addWidget(self.title_label)
@@ -234,7 +266,9 @@ class DataRakshakWindow(QMainWindow):
         layout.addWidget(self.certificate_button)
         layout.addWidget(self.audit_button)
         layout.addWidget(self.history_button)
-        layout.addWidget(self.certificate_verify_button)
+        layout.addWidget(
+            self.certificate_verify_button
+        )
 
         container = QWidget()
         container.setLayout(layout)
@@ -255,7 +289,9 @@ class DataRakshakWindow(QMainWindow):
         hover_color: str,
     ) -> QPushButton:
         button = QPushButton(text)
+
         button.setMinimumHeight(48)
+
         button.setCursor(
             Qt.CursorShape.PointingHandCursor
         )
@@ -280,15 +316,24 @@ class DataRakshakWindow(QMainWindow):
             }}
 
             QPushButton:disabled {{
-                background-color: #9ca3af;
-                color: #e5e7eb;
+                background-color: #64748b;
+                color: #cbd5e1;
             }}
             """
         )
 
         return button
 
-    def set_busy(self, busy: bool) -> None:
+    def is_operation_running(self) -> bool:
+        return (
+            self.operation_thread is not None
+            and self.operation_thread.isRunning()
+        )
+
+    def set_busy(
+        self,
+        busy: bool,
+    ) -> None:
         enabled = not busy
 
         self.create_disk_button.setEnabled(enabled)
@@ -296,7 +341,10 @@ class DataRakshakWindow(QMainWindow):
         self.verify_button.setEnabled(enabled)
         self.audit_button.setEnabled(enabled)
         self.history_button.setEnabled(enabled)
-        self.certificate_verify_button.setEnabled(enabled)
+
+        self.certificate_verify_button.setEnabled(
+            enabled
+        )
 
         if busy:
             self.certificate_button.setEnabled(False)
@@ -305,15 +353,12 @@ class DataRakshakWindow(QMainWindow):
                 self.verification_passed
             )
 
-        QApplication.processEvents()
-
     def reset_progress(
         self,
         label: str = "Operation Progress",
     ) -> None:
         self.progress_label.setText(label)
         self.progress_bar.setValue(0)
-        QApplication.processEvents()
 
     def update_wipe_progress(
         self,
@@ -327,6 +372,7 @@ class DataRakshakWindow(QMainWindow):
         self.progress_label.setText(
             "Secure Wipe Progress"
         )
+
         self.progress_bar.setValue(
             safe_progress
         )
@@ -336,8 +382,6 @@ class DataRakshakWindow(QMainWindow):
             f"Job: {self.current_job_number}\n"
             f"Progress: {safe_progress}%"
         )
-
-        QApplication.processEvents()
 
     def update_verification_progress(
         self,
@@ -351,6 +395,7 @@ class DataRakshakWindow(QMainWindow):
         self.progress_label.setText(
             "Verification Progress"
         )
+
         self.progress_bar.setValue(
             safe_progress
         )
@@ -360,8 +405,6 @@ class DataRakshakWindow(QMainWindow):
             f"Job: {self.current_job_number}\n"
             f"Progress: {safe_progress}%"
         )
-
-        QApplication.processEvents()
 
     def safe_audit(
         self,
@@ -375,6 +418,7 @@ class DataRakshakWindow(QMainWindow):
                 status=status,
                 details=details or {},
             )
+
         except Exception:
             pass
 
@@ -390,10 +434,167 @@ class DataRakshakWindow(QMainWindow):
                 job_id=self.current_job_id,
                 **updates,
             )
+
         except Exception:
             pass
 
+    def start_background_operation(
+        self,
+        operation_name: str,
+        operation: Callable[..., Any],
+        progress_handler: Callable[[int], None],
+    ) -> None:
+        if self.is_operation_running():
+            QMessageBox.information(
+                self,
+                "Operation Running",
+                "Another operation is already running.",
+            )
+            return
+
+        thread = QThread(self)
+
+        worker = OperationWorker(
+            operation,
+            use_progress=True,
+        )
+
+        worker.moveToThread(thread)
+
+        thread.started.connect(
+            worker.run
+        )
+
+        worker.progress.connect(
+            progress_handler
+        )
+
+        worker.result.connect(
+            lambda result, name=operation_name: (
+                self.handle_background_result(
+                    name,
+                    result,
+                )
+            )
+        )
+
+        worker.error.connect(
+            lambda message, name=operation_name: (
+                self.handle_background_error(
+                    name,
+                    message,
+                )
+            )
+        )
+
+        worker.finished.connect(
+            thread.quit
+        )
+
+        worker.finished.connect(
+            worker.deleteLater
+        )
+
+        thread.finished.connect(
+            thread.deleteLater
+        )
+
+        thread.finished.connect(
+            self.background_thread_finished
+        )
+
+        self.operation_thread = thread
+        self.operation_worker = worker
+        self.active_operation = operation_name
+
+        self.set_busy(True)
+
+        thread.start()
+
+    def handle_background_result(
+        self,
+        operation_name: str,
+        result: object,
+    ) -> None:
+        if not isinstance(result, dict):
+            self.handle_background_error(
+                operation_name,
+                "The operation returned an invalid result.",
+            )
+            return
+
+        if operation_name == "WIPE":
+            self.handle_wipe_result(result)
+
+        elif operation_name == "VERIFY":
+            self.handle_verification_result(result)
+
+    def handle_background_error(
+        self,
+        operation_name: str,
+        error_message: str,
+    ) -> None:
+        if operation_name == "WIPE":
+            self.safely_update_job(
+                status="FAILED",
+                verification_status="FAILED",
+                error_message=error_message,
+                mark_completed=True,
+            )
+
+            self.safe_audit(
+                action="WIPE_FAKE_TEST_DISK",
+                status="FAILED",
+                details={
+                    "job_number": (
+                        self.current_job_number
+                    ),
+                    "error": error_message,
+                },
+            )
+
+            self.status_label.setText(
+                "Secure wipe failed ❌\n"
+                f"Error: {error_message}"
+            )
+
+        elif operation_name == "VERIFY":
+            self.verification_passed = False
+
+            self.safely_update_job(
+                status="FAILED",
+                verification_status="FAILED",
+                error_message=error_message,
+                mark_completed=True,
+            )
+
+            self.safe_audit(
+                action="VERIFY_WIPE_RESULT",
+                status="FAILED",
+                details={
+                    "job_number": (
+                        self.current_job_number
+                    ),
+                    "error": error_message,
+                },
+            )
+
+            self.status_label.setText(
+                "Verification failed ❌\n"
+                f"Error: {error_message}"
+            )
+
+    def background_thread_finished(self) -> None:
+        self.operation_thread = None
+        self.operation_worker = None
+        self.active_operation = None
+
+        self.set_busy(False)
+
     def create_fake_test_disk(self) -> None:
+        if self.is_operation_running():
+            return
+
         self.verification_passed = False
         self.current_job_id = None
         self.current_job_number = None
@@ -401,6 +602,7 @@ class DataRakshakWindow(QMainWindow):
         self.reset_progress(
             "Fake Disk Creation"
         )
+
         self.set_busy(True)
 
         self.status_label.setText(
@@ -411,16 +613,15 @@ class DataRakshakWindow(QMainWindow):
         QApplication.processEvents()
 
         try:
-            TEST_DISK_PATH.parent.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
+            ensure_runtime_directories()
 
             TEST_DISK_PATH.write_bytes(
                 b"A" * TEST_DISK_SIZE
             )
 
-            size = TEST_DISK_PATH.stat().st_size
+            disk_size = (
+                TEST_DISK_PATH.stat().st_size
+            )
 
             self.progress_bar.setValue(100)
 
@@ -429,14 +630,14 @@ class DataRakshakWindow(QMainWindow):
                 status="SUCCESS",
                 details={
                     "path": str(TEST_DISK_PATH),
-                    "size_bytes": size,
+                    "size_bytes": disk_size,
                 },
             )
 
             self.status_label.setText(
                 "Fake test disk created successfully ✅\n"
                 f"Location: {TEST_DISK_PATH}\n"
-                f"Size: {size} bytes"
+                f"Size: {disk_size} bytes"
             )
 
         except Exception as error:
@@ -457,6 +658,14 @@ class DataRakshakWindow(QMainWindow):
             self.set_busy(False)
 
     def start_fake_disk_wipe(self) -> None:
+        if self.is_operation_running():
+            QMessageBox.information(
+                self,
+                "Operation Running",
+                "Wait for the current operation to finish.",
+            )
+            return
+
         if not TEST_DISK_PATH.exists():
             QMessageBox.information(
                 self,
@@ -480,12 +689,17 @@ class DataRakshakWindow(QMainWindow):
             QMessageBox.StandardButton.No,
         )
 
-        if confirmation != QMessageBox.StandardButton.Yes:
+        if (
+            confirmation
+            != QMessageBox.StandardButton.Yes
+        ):
             self.safe_audit(
                 action="WIPE_FAKE_TEST_DISK",
                 status="CANCELLED",
                 details={
-                    "reason": "User cancelled operation",
+                    "reason": (
+                        "User cancelled operation"
+                    ),
                 },
             )
 
@@ -499,6 +713,7 @@ class DataRakshakWindow(QMainWindow):
         self.reset_progress(
             "Secure Wipe Progress"
         )
+
         self.set_busy(True)
 
         self.status_label.setText(
@@ -512,14 +727,19 @@ class DataRakshakWindow(QMainWindow):
             job = create_wipe_job(
                 device_name=DEVICE_NAME,
                 serial_number=SERIAL_NUMBER,
-                total_bytes=TEST_DISK_PATH.stat().st_size,
+                total_bytes=(
+                    TEST_DISK_PATH.stat().st_size
+                ),
                 wipe_method=WIPE_METHOD,
             )
 
-            self.current_job_id = job["id"]
-            self.current_job_number = job[
-                "job_number"
-            ]
+            self.current_job_id = int(
+                job["id"]
+            )
+
+            self.current_job_number = str(
+                job["job_number"]
+            )
 
             update_wipe_job(
                 job_id=self.current_job_id,
@@ -531,40 +751,12 @@ class DataRakshakWindow(QMainWindow):
                 f"Job: {self.current_job_number}"
             )
 
-            QApplication.processEvents()
-
-            result = wipe_test_disk(
-                progress_callback=(
+            self.start_background_operation(
+                operation_name="WIPE",
+                operation=wipe_test_disk,
+                progress_handler=(
                     self.update_wipe_progress
-                )
-            )
-
-            update_wipe_job(
-                job_id=self.current_job_id,
-                status="WIPE_COMPLETED",
-            )
-
-            self.safe_audit(
-                action="WIPE_FAKE_TEST_DISK",
-                status="SUCCESS",
-                details={
-                    "job_number": self.current_job_number,
-                    "written_bytes": result[
-                        "written_bytes"
-                    ],
-                    "wipe_status": result["status"],
-                    "final_progress": result[
-                        "final_progress"
-                    ],
-                },
-            )
-
-            self.progress_bar.setValue(100)
-
-            self.status_label.setText(
-                "Secure wipe completed successfully ✅\n"
-                f"Job: {self.current_job_number}\n"
-                f"Written bytes: {result['written_bytes']}"
+                ),
             )
 
         except Exception as error:
@@ -579,20 +771,64 @@ class DataRakshakWindow(QMainWindow):
                 action="WIPE_FAKE_TEST_DISK",
                 status="FAILED",
                 details={
-                    "job_number": self.current_job_number,
+                    "job_number": (
+                        self.current_job_number
+                    ),
                     "error": str(error),
                 },
             )
 
             self.status_label.setText(
-                "Secure wipe failed ❌\n"
+                "Secure wipe could not start ❌\n"
                 f"Error: {error}"
             )
 
-        finally:
             self.set_busy(False)
 
+    def handle_wipe_result(
+        self,
+        result: dict[str, Any],
+    ) -> None:
+        self.progress_bar.setValue(100)
+
+        self.safely_update_job(
+            status="WIPE_COMPLETED",
+        )
+
+        self.safe_audit(
+            action="WIPE_FAKE_TEST_DISK",
+            status="SUCCESS",
+            details={
+                "job_number": (
+                    self.current_job_number
+                ),
+                "written_bytes": result.get(
+                    "written_bytes"
+                ),
+                "wipe_status": result.get(
+                    "status"
+                ),
+                "final_progress": result.get(
+                    "final_progress"
+                ),
+            },
+        )
+
+        self.status_label.setText(
+            "Secure wipe completed successfully ✅\n"
+            f"Job: {self.current_job_number}\n"
+            f"Written bytes: {result.get('written_bytes')}"
+        )
+
     def start_verification(self) -> None:
+        if self.is_operation_running():
+            QMessageBox.information(
+                self,
+                "Operation Running",
+                "Wait for the current operation to finish.",
+            )
+            return
+
         if not TEST_DISK_PATH.exists():
             QMessageBox.information(
                 self,
@@ -614,115 +850,107 @@ class DataRakshakWindow(QMainWindow):
         self.reset_progress(
             "Verification Progress"
         )
-        self.set_busy(True)
 
         self.status_label.setText(
             "Verification is starting...\n"
             f"Job: {self.current_job_number}"
         )
 
-        QApplication.processEvents()
+        self.start_background_operation(
+            operation_name="VERIFY",
+            operation=verify_test_disk,
+            progress_handler=(
+                self.update_verification_progress
+            ),
+        )
 
-        try:
-            result = verify_test_disk(
-                progress_callback=(
-                    self.update_verification_progress
-                )
-            )
+    def handle_verification_result(
+        self,
+        result: dict[str, Any],
+    ) -> None:
+        if result.get("status") == "passed":
+            self.verification_passed = True
 
-            if result["status"] == "passed":
-                self.verification_passed = True
+            self.progress_bar.setValue(100)
 
-                self.progress_bar.setValue(100)
-
-                update_wipe_job(
-                    job_id=self.current_job_id,
-                    status="VERIFIED",
-                    verification_status="PASSED",
-                )
-
-                self.safe_audit(
-                    action="VERIFY_WIPE_RESULT",
-                    status="SUCCESS",
-                    details={
-                        "job_number": (
-                            self.current_job_number
-                        ),
-                        "checked_bytes": result[
-                            "checked_bytes"
-                        ],
-                        "final_progress": result[
-                            "final_progress"
-                        ],
-                    },
-                )
-
-                self.status_label.setText(
-                    "Verification passed successfully ✅\n"
-                    f"Job: {self.current_job_number}\n"
-                    f"Checked bytes: {result['checked_bytes']}"
-                )
-
-            else:
-                update_wipe_job(
-                    job_id=self.current_job_id,
-                    status="FAILED",
-                    verification_status="FAILED",
-                    error_message=(
-                        "Non-zero data found at "
-                        f"position {result['failed_position']}"
-                    ),
-                    mark_completed=True,
-                )
-
-                self.safe_audit(
-                    action="VERIFY_WIPE_RESULT",
-                    status="FAILED",
-                    details={
-                        "job_number": (
-                            self.current_job_number
-                        ),
-                        "failed_position": result[
-                            "failed_position"
-                        ],
-                        "checked_bytes": result[
-                            "checked_bytes"
-                        ],
-                    },
-                )
-
-                self.status_label.setText(
-                    "Verification failed ❌\n"
-                    "Non-zero data was found.\n"
-                    f"Position: {result['failed_position']}"
-                )
-
-        except Exception as error:
             self.safely_update_job(
-                status="FAILED",
-                verification_status="FAILED",
-                error_message=str(error),
-                mark_completed=True,
+                status="VERIFIED",
+                verification_status="PASSED",
             )
 
             self.safe_audit(
                 action="VERIFY_WIPE_RESULT",
-                status="FAILED",
+                status="SUCCESS",
                 details={
-                    "job_number": self.current_job_number,
-                    "error": str(error),
+                    "job_number": (
+                        self.current_job_number
+                    ),
+                    "checked_bytes": result.get(
+                        "checked_bytes"
+                    ),
+                    "final_progress": result.get(
+                        "final_progress"
+                    ),
                 },
             )
 
             self.status_label.setText(
-                "Verification failed ❌\n"
-                f"Error: {error}"
+                "Verification passed successfully ✅\n"
+                f"Job: {self.current_job_number}\n"
+                f"Checked bytes: {result.get('checked_bytes')}"
             )
 
-        finally:
-            self.set_busy(False)
+            return
+
+        self.verification_passed = False
+
+        failed_position = result.get(
+            "failed_position"
+        )
+
+        self.progress_bar.setValue(
+            int(
+                result.get(
+                    "final_progress",
+                    0,
+                )
+            )
+        )
+
+        self.safely_update_job(
+            status="FAILED",
+            verification_status="FAILED",
+            error_message=(
+                "Non-zero data found at "
+                f"position {failed_position}"
+            ),
+            mark_completed=True,
+        )
+
+        self.safe_audit(
+            action="VERIFY_WIPE_RESULT",
+            status="FAILED",
+            details={
+                "job_number": (
+                    self.current_job_number
+                ),
+                "failed_position": failed_position,
+                "checked_bytes": result.get(
+                    "checked_bytes"
+                ),
+            },
+        )
+
+        self.status_label.setText(
+            "Verification failed ❌\n"
+            "Non-zero data was found.\n"
+            f"Position: {failed_position}"
+        )
 
     def create_certificate(self) -> None:
+        if self.is_operation_running():
+            return
+
         if not self.verification_passed:
             QMessageBox.information(
                 self,
@@ -742,6 +970,7 @@ class DataRakshakWindow(QMainWindow):
         self.reset_progress(
             "Certificate Generation"
         )
+
         self.set_busy(True)
 
         self.status_label.setText(
@@ -755,7 +984,9 @@ class DataRakshakWindow(QMainWindow):
             result = generate_certificate(
                 device_name=DEVICE_NAME,
                 serial_number=SERIAL_NUMBER,
-                total_bytes=TEST_DISK_PATH.stat().st_size,
+                total_bytes=(
+                    TEST_DISK_PATH.stat().st_size
+                ),
                 wipe_method=WIPE_METHOD,
                 verification_status="PASSED",
             )
@@ -776,7 +1007,9 @@ class DataRakshakWindow(QMainWindow):
                 action="GENERATE_CERTIFICATE",
                 status="SUCCESS",
                 details={
-                    "job_number": self.current_job_number,
+                    "job_number": (
+                        self.current_job_number
+                    ),
                     "certificate_number": result[
                         "certificate_number"
                     ],
@@ -815,7 +1048,9 @@ class DataRakshakWindow(QMainWindow):
                 action="GENERATE_CERTIFICATE",
                 status="FAILED",
                 details={
-                    "job_number": self.current_job_number,
+                    "job_number": (
+                        self.current_job_number
+                    ),
                     "error": str(error),
                 },
             )
@@ -829,9 +1064,13 @@ class DataRakshakWindow(QMainWindow):
             self.set_busy(False)
 
     def check_audit_log(self) -> None:
+        if self.is_operation_running():
+            return
+
         self.reset_progress(
             "Audit Log Verification"
         )
+
         self.set_busy(True)
 
         self.status_label.setText(
@@ -875,8 +1114,13 @@ class DataRakshakWindow(QMainWindow):
             self.set_busy(False)
 
     def show_wipe_history(self) -> None:
+        if self.is_operation_running():
+            return
+
         try:
-            jobs = list_wipe_jobs(limit=50)
+            jobs = list_wipe_jobs(
+                limit=50
+            )
 
         except Exception as error:
             QMessageBox.critical(
@@ -887,10 +1131,15 @@ class DataRakshakWindow(QMainWindow):
             return
 
         dialog = QDialog(self)
+
         dialog.setWindowTitle(
             "DataRakshak Wipe History"
         )
-        dialog.resize(1050, 500)
+
+        dialog.resize(
+            1050,
+            500,
+        )
 
         table = QTableWidget()
         table.setRowCount(len(jobs))
@@ -923,7 +1172,11 @@ class DataRakshakWindow(QMainWindow):
                 values
             ):
                 item = QTableWidgetItem(
-                    "" if value is None else str(value)
+                    (
+                        ""
+                        if value is None
+                        else str(value)
+                    )
                 )
 
                 item.setFlags(
@@ -946,6 +1199,7 @@ class DataRakshakWindow(QMainWindow):
         info_label = QLabel(
             f"Total jobs displayed: {len(jobs)}"
         )
+
         info_label.setStyleSheet(
             """
             font-size: 14px;
@@ -959,6 +1213,7 @@ class DataRakshakWindow(QMainWindow):
         dialog_layout.addWidget(table)
 
         dialog.setLayout(dialog_layout)
+
         dialog.setStyleSheet(
             """
             QDialog {
@@ -983,11 +1238,16 @@ class DataRakshakWindow(QMainWindow):
         dialog.exec()
 
     def verify_certificate_file(self) -> None:
-        selected_file, _ = QFileDialog.getOpenFileName(
-            self,
-            "Select DataRakshak Certificate JSON",
-            str(Path("certificates").resolve()),
-            "Certificate JSON Files (*.json)",
+        if self.is_operation_running():
+            return
+
+        selected_file, _ = (
+            QFileDialog.getOpenFileName(
+                self,
+                "Select DataRakshak Certificate JSON",
+                str(CERTIFICATES_DIR),
+                "Certificate JSON Files (*.json)",
+            )
         )
 
         if not selected_file:
@@ -999,6 +1259,7 @@ class DataRakshakWindow(QMainWindow):
         self.reset_progress(
             "Certificate Verification"
         )
+
         self.set_busy(True)
 
         self.status_label.setText(
@@ -1023,9 +1284,14 @@ class DataRakshakWindow(QMainWindow):
                         "certificate_number"
                     ],
                     "json_path": result["json_path"],
-                    "hash_valid": result["hash_valid"],
+                    "hash_valid": result[
+                        "hash_valid"
+                    ],
                     "signature_valid": result[
                         "signature_valid"
+                    ],
+                    "fingerprint_valid": result[
+                        "fingerprint_valid"
                     ],
                 },
             )
@@ -1034,7 +1300,7 @@ class DataRakshakWindow(QMainWindow):
                 self.status_label.setText(
                     "Certificate is VALID ✅\n"
                     f"Certificate: {result['certificate_number']}\n"
-                    "Hash: Valid | Digital signature: Valid"
+                    "Hash and digital signature are valid."
                 )
 
                 QMessageBox.information(
@@ -1046,7 +1312,8 @@ class DataRakshakWindow(QMainWindow):
                         f"{result['certificate_number']}\n"
                         f"Device: {result['device_name']}\n"
                         "Hash: Valid\n"
-                        "Digital signature: Valid"
+                        "Digital signature: Valid\n"
+                        "Public-key fingerprint: Valid"
                     ),
                 )
 
@@ -1087,6 +1354,26 @@ class DataRakshakWindow(QMainWindow):
 
         finally:
             self.set_busy(False)
+
+    def closeEvent(
+        self,
+        event: QCloseEvent,
+    ) -> None:
+        if self.is_operation_running():
+            QMessageBox.warning(
+                self,
+                "Operation Running",
+                (
+                    "A wipe or verification operation is running.\n\n"
+                    "Wait for it to finish before closing "
+                    "DataRakshak."
+                ),
+            )
+
+            event.ignore()
+            return
+
+        event.accept()
 
 
 def start_application() -> None:
