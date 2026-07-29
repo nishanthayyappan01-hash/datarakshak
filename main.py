@@ -1,17 +1,23 @@
 from __future__ import annotations
 
-from agent.paths import ensure_runtime_directories
+from agent.paths import (
+    ensure_runtime_directories,
+)
 
 
 def main() -> None:
-    """Start the DataRakshak desktop application."""
+    """Start the unified DataRakshak desktop application."""
 
-    print("DataRakshak project started successfully")
+    print(
+        "DataRakshak project started successfully"
+    )
 
     try:
         ensure_runtime_directories()
 
-        from agent.gui import start_application
+        from agent.combined_gui import (
+            start_application,
+        )
 
         start_application()
 
@@ -24,7 +30,10 @@ def main() -> None:
         print(
             "DataRakshak could not be started."
         )
-        print(f"Error: {error}")
+
+        print(
+            f"Error: {error}"
+        )
 
         raise SystemExit(1) from error
 
